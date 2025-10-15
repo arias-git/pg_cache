@@ -29,6 +29,8 @@ typedef struct
     TupleTableSlot **rows;
     int nrows;
     int ncols;
+    int nalloc;
+    TupleDesc tupdesc;
 } CacheEntry;
 
 //TODO: Eventually these need to be dynamic
@@ -36,33 +38,49 @@ typedef struct
 static CacheEntry cache[MAX_CACHE];
 static int cache_count = 0;
 
-static DestReceiver *CreateCacheDestReceiver(CacheEntry *entry, _Bool is_capture);
+static MemoryContext CacheContext = NULL;
+
+static DestReceiver *CreateCacheDestReceiver(CacheEntry *entry, _Bool is_capture, DestReceiver *origDest);
 typedef struct 
 {
     DestReceiver pub;
     CacheEntry *entry;
     bool is_capture;
+    int emit_index;
+    DestReceiver *origDest;
 } CacheDestReceiver;
 
 void myReceiveSlot(TupleTableSlot *slot, DestReceiver *self)
 {
-    CacheDestReceiver *rec = (CacheDestReceiver *) self;
-
-    if (!slot || TupIsNull(slot))
-        return;
+     CacheDestReceiver *rec = (CacheDestReceiver *) self;
 
     if (rec->is_capture)
     {
-        // Can limit the size of a cached item
-        if (rec->entry->nrows >= 1024)
-            return;
-        TupleTableSlot **arr = rec->entry->rows;
-        arr[rec->entry->nrows] = slot;
-        rec->entry->nrows++;
+        /* Copy the tuple into the cache context */
+        MemoryContext old = MemoryContextSwitchTo(CacheContext);
+        TupleTableSlot *copy = ExecCopySlot(slot, CacheContext);
+
+        if (rec->entry->nrows >= rec->entry->nalloc)
+        {
+            rec->entry->nalloc = rec->entry->nalloc ? rec->entry->nalloc * 2 : 16;
+            rec->entry->rows = repalloc(rec->entry->rows,
+                                        rec->entry->nalloc * sizeof(TupleTableSlot *));
+        }
+
+        rec->entry->rows[rec->entry->nrows++] = copy;
+        MemoryContextSwitchTo(old);
     }
     else
     {
-        standard_ExecutorRun(NULL, ForwardScanDirection, 1, false);
+        /* Emit cached tuple to client */
+        if (rec->emit_index < rec->entry->nrows)
+        {
+            TupleTableSlot *cached_slot = rec->entry->rows[rec->emit_index++];
+            TupleTableSlot *out_slot = ExecCopySlot(cached_slot, CurrentMemoryContext);
+
+            /* Send to client via original DestReceiver */
+            rec->origDest->receiveSlot(out_slot, rec->origDest);
+        }
     }
 }
 
@@ -87,7 +105,7 @@ myDestroyReceiver(DestReceiver *self)
 
 /* Create a DestReceiver instance */
 static DestReceiver *
-CreateCacheDestReceiver(CacheEntry *entry, bool is_capture)
+CreateCacheDestReceiver(CacheEntry *entry, bool is_capture, DestReceiver *origDest)
 {
     CacheDestReceiver *rec = palloc0(sizeof(CacheDestReceiver));
     rec->pub.receiveSlot = myReceiveSlot;
@@ -96,6 +114,8 @@ CreateCacheDestReceiver(CacheEntry *entry, bool is_capture)
     rec->pub.rDestroy = myDestroyReceiver;
     rec->entry = entry;
     rec->is_capture = is_capture;
+    rec->emit_index = 0;
+    rec->origDest = origDest;
     return (DestReceiver *) rec;
 }
 
@@ -146,20 +166,22 @@ void MyExecutorStart(QueryDesc *queryDesc, int eflags)
         if (entry)
         {
             /* Serve cached results */
-            queryDesc->dest = CreateCacheDestReceiver(entry, false);
+            queryDesc->dest = CreateCacheDestReceiver(entry, false, queryDesc->dest);
             ereport(LOG, (errmsg("[myext] serving cached results")));
         }
         else
         {
-            /* Capture results */
+            /* Capture new query */
             if (cache_count < MAX_CACHE)
             {
                 entry = &cache[cache_count++];
                 entry->query = pstrdup(queryDesc->sourceText);
-                entry->rows = palloc0(sizeof(TupleTableSlot*) * 1024);
+                entry->rows = NULL;
                 entry->nrows = 0;
-                queryDesc->dest = CreateCacheDestReceiver(entry, true);
-                ereport(LOG, (errmsg("[myext] capturing results for new query")));
+                entry->nalloc = 0;
+                entry->tupdesc = queryDesc->tupDesc;
+                queryDesc->dest = CreateCacheDestReceiver(entry, true, queryDesc->dest);
+                ereport(LOG, (errmsg("[pg_cache] capturing results for: %s", queryDesc->sourceText)));
             }
         }
     }
@@ -179,6 +201,11 @@ void _PG_init(void)
 {
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = MyExecutorStart;
+
+    if (!CacheContext)
+        CacheContext = AllocSetContextCreate(TopMemoryContext,
+                                             "pg_cache context",
+                                             ALLOCSET_DEFAULT_SIZES);
 
     ereport(LOG, (errmsg("[pg_cache] Loaded")));
 
